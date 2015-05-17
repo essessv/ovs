@@ -208,7 +208,8 @@ table_ids_list_and_bitmap_from_string(struct ovs_list *tables,
     temp = stemp;
     while(stemp) {
         tok = strsep(&stemp, ",");
-        if(!str_to_uint(tok, 10, &table_id) || table_id > TABLE_IDS_BITMAP_LEN-1) {
+        if(!str_to_uint(tok, 10, &table_id)
+                || table_id > TABLE_IDS_BITMAP_LEN-1) {
             LIST_FOR_EACH (tnode, lnode, tables) {
                free(tnode);
             }
@@ -343,7 +344,9 @@ parse_options(int argc, char *argv[])
             break;
 
         case 'T':
-            retval = table_ids_list_and_bitmap_from_string(&tables, &bmtables, optarg);
+            retval = table_ids_list_and_bitmap_from_string(&tables,
+                                                           &bmtables,
+                                                           optarg);
             if (retval < 0) {
                 ovs_fatal(0, "one of the passed table IDs %s for "
                         "-T or --tables is invalid", optarg);
@@ -2637,7 +2640,9 @@ read_flows_from_file(const char *filename, struct hmap *ht_cls, int index)
             fm.table_id = 0x0;
         }
 
-        if (!list_is_empty(&tables) && bmtables && !bitmap_is_set(bmtables, fm.table_id)) {
+        if (!list_is_empty(&tables)
+                && bmtables
+                && !bitmap_is_set(bmtables, fm.table_id)) {
             /*
              * Ignore this flow if --tables is specified but does
              * not contain the table_id.
@@ -2763,7 +2768,9 @@ read_flows_from_switch(struct vconn *vconn,
         version->flags = 0;
         version->ofpacts_len = fs.ofpacts_len;
         version->ofpacts = xmemdup(fs.ofpacts, fs.ofpacts_len);
-        if (!list_is_empty(&tables) && bmtables && !bitmap_is_set(bmtables, fs.table_id)) {
+        if (!list_is_empty(&tables)
+                && bmtables
+                && !bitmap_is_set(bmtables, fs.table_id)) {
             /*
              * Ignore this flow if --tables is specified but does
              * not contain the table_id.
@@ -2882,7 +2889,10 @@ add_update_delete_switch_flows(struct ovs_list *requests,
             }
             classifier_publish(cls);
             CLS_FOR_EACH (fte, rule, cls) {
-                construct_flow_mods(requests, protocol, fte, ht_cls_node->table_id);
+                construct_flow_mods(requests,
+                                    protocol,
+                                    fte,
+                                    ht_cls_node->table_id);
             }
             fte_free_all(cls);
         }
