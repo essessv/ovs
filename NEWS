@@ -111,6 +111,8 @@ v2.4.0 - xx xxx xxxx
    - ovs-ofctl: replace-flows and diff-flows now operate on multiple tables.
    - ovs-ofctl: --tables option added to replace-flows and diff-flows to allow
      specific tables to be replaced or diffed.
+   - ovs-ofctl: replace-flows and diff-flows now query the switch for visible
+     tables. Hidden tables are ignored.
    - ovs-ofctl works for OF version 1.3 and above.
 
 v2.3.0 - 14 Aug 2014
