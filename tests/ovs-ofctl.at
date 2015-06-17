@@ -2880,7 +2880,7 @@ AT_CHECK([ovs-ofctl --bundle add-flows br0 add-flows.txt])
 
 dnl Replace some flows in the bridge.
 for i in 1 3 5 7; do echo "dl_vlan=$i,importance=`expr $i + 10`,actions=drop"; done > replace-flows.txt
-AT_CHECK([ovs-ofctl --bundle replace-flows br0 replace-flows.txt])
+AT_CHECK([ovs-ofctl -O OpenFlow14 --bundle replace-flows br0 replace-flows.txt])
 
 dnl Dump them and compare the dump flows output against the expected output.
 for i in 1 2 3 4 5 6 7 8; do if [[ `expr $i % 2` -eq 1 ]]; then importance=`expr $i + 10`; else importance=$i; fi; echo " importance=$importance, dl_vlan=$i actions=drop"; done | sort > expout
