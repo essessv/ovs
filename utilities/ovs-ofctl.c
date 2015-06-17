@@ -112,8 +112,15 @@ static char *unixctl_path;
 static struct ovs_list tables;
 
 /* bmtables is a bitmap where an offset is set if the corresponding table
- * ID is specified in --tables. */
+ * ID needs to be operated on by replace-flows or diff-flows command.
+ * If a table ID is hidden, the corresponding offset is unset even if specified
+ * in -T, --tables. */
 static unsigned long *bmtables;
+
+/*
+ * visible_tables is a bitmap where an offset is set if the corresponding table
+ * is not a hidden table. */
+static unsigned long *visible_tables;
 
 /* --sort, --rsort: Sort order. */
 enum sort_order { SORT_ASC, SORT_DESC };
@@ -134,9 +141,16 @@ static bool recv_flow_stats_reply(struct vconn *, ovs_be32 send_xid,
                                   struct ofputil_flow_stats *,
                                   struct ofpbuf *ofpacts);
 
-int table_ids_list_and_bitmap_from_string(struct ovs_list *tables,
+static void perform_stats_transaction(struct vconn *, struct ofpbuf *request, bool dump);
+
+static int table_ids_list_and_bitmap_from_string(struct ovs_list *tables,
                                        unsigned long **bmtables,
                                        const char *s);
+
+static void update_bitmaps_with_supported_table_ids(struct vconn *vconn);
+
+static void populate_visible_tables_bitmap(struct vconn *vconn,
+                                    const struct ofp_header *oh);
 
 bool print_diff_flows(struct classifier *cls);
 
@@ -193,7 +207,7 @@ get_table_classifier(struct hmap *ht_cls, uint8_t table_id)
  * containing the table_ids in the order specified in the --tables argument.
  * Also creates a bitmap of specified table IDs.
  */
-int
+static int
 table_ids_list_and_bitmap_from_string(struct ovs_list *tables,
                                        unsigned long **bmtables,
                                        const char *s)
@@ -225,6 +239,52 @@ table_ids_list_and_bitmap_from_string(struct ovs_list *tables,
     }
     free(temp);
     return 0;
+}
+
+/*
+ * Make sure a bmtables offset is set only if the corresponding
+ * table ID is supported (not hidden) in the switch. */
+static void
+update_bitmaps_with_supported_table_ids(struct vconn *vconn)
+{
+    struct ofpbuf *request;
+
+    visible_tables = bitmap_allocate(TABLE_IDS_BITMAP_LEN);
+
+    if(list_is_empty(&tables)) {
+        /* Initialize the bitmap bmtables and set all bits. */
+        bmtables = bitmap_allocate1(TABLE_IDS_BITMAP_LEN);
+    }
+
+    request = ofputil_encode_table_features_request(vconn_get_version(vconn));
+    perform_stats_transaction(vconn, request, false);
+    bitmap_and(bmtables, visible_tables, TABLE_IDS_BITMAP_LEN);
+}
+
+/*
+ * Get all visible table IDs and set offsets in visible_tables bitmap that
+ * correspond to the table IDs. */
+static void
+populate_visible_tables_bitmap(struct vconn *vconn, const struct ofp_header *oh)
+{
+    struct ofpbuf msg;
+    ofpbuf_use_const(&msg, oh, ntohs(oh->length));
+    ofpraw_pull_assert(&msg);
+
+    for(;;) {
+        struct ofputil_table_features features;
+        int retval;
+
+        retval = ofputil_decode_table_features(&msg, &features, true);
+        if (retval) {
+            if (retval != EOF) {
+                ovs_fatal(0, "%s: Error while decoding table features: %s",
+                          vconn_get_name(vconn), ofperr_get_name(retval));
+            }
+            return;
+        }
+        bitmap_set(visible_tables, features.table_id, true);
+    }
 }
 
 int
@@ -665,7 +725,7 @@ dump_trivial_transaction(const char *vconn_name, enum ofpraw raw)
 }
 
 static void
-dump_stats_transaction(struct vconn *vconn, struct ofpbuf *request)
+perform_stats_transaction(struct vconn *vconn, struct ofpbuf *request, bool dump)
 {
     const struct ofp_header *request_oh = request->data;
     ovs_be32 send_xid = request_oh->xid;
@@ -686,9 +746,13 @@ dump_stats_transaction(struct vconn *vconn, struct ofpbuf *request)
         recv_xid = ((struct ofp_header *) reply->data)->xid;
         if (send_xid == recv_xid) {
             enum ofpraw raw;
-
-            ofp_print(stdout, reply->data, reply->size, verbosity + 1);
-
+            if (dump) {
+                ofp_print(stdout, reply->data, reply->size, verbosity + 1);
+            }
+            else {
+                /* Update bmtables - set offset = table ID. */
+                populate_visible_tables_bitmap(vconn, (struct ofp_header *) reply->data);
+            }
             ofpraw_decode(&raw, reply->data);
             if (ofptype_from_ofpraw(raw) == OFPTYPE_ERROR) {
                 done = true;
@@ -705,6 +769,12 @@ dump_stats_transaction(struct vconn *vconn, struct ofpbuf *request)
         }
         ofpbuf_delete(reply);
     }
+}
+
+static void
+dump_stats_transaction(struct vconn *vconn, struct ofpbuf *request)
+{
+    perform_stats_transaction(vconn, request, true);
 }
 
 static void
@@ -2738,6 +2808,9 @@ read_flows_from_switch(struct vconn *vconn,
     fsr.aggregate = false;
     match_init_catchall(&fsr.match);
 
+    /* Only get tables that are not hidden. */
+    update_bitmaps_with_supported_table_ids(vconn);
+
     if (list_size(&tables) == 1) {
         /* Only retrieve flows from the specified table. */
         struct tables_node * tnode;
@@ -2909,13 +2982,18 @@ ofctl_replace_flows(struct ovs_cmdl_context *ctx)
     struct ovs_list requests;
     struct vconn *vconn;
 
+
     /* Initialize the hash map. */
     hmap_init(&ht_cls);
 
-    /* Setup connection to switch and generate dump request. */
+    /* Read flows from the file. */
     usable_protocols = read_flows_from_file(ctx->argv[2], &ht_cls, FILE_IDX);
+
+    /* Setup connection to the switch. */
     protocol = open_vconn_for_flow_mod(ctx->argv[1], &vconn, usable_protocols);
     protocol = set_protocol_for_flow_dump(vconn, protocol, usable_protocols);
+
+    /* Generate switch dump request. */
     read_flows_from_switch(vconn, protocol, &ht_cls, SWITCH_IDX);
 
     list_init(&requests);

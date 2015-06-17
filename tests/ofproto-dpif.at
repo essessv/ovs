@@ -3693,7 +3693,7 @@ priority=50 tcp ip_frag=no              actions=move:OXM_OF_TCP_DST[[]]->OXM_OF_
 priority=50 tcp ip_frag=first           actions=move:OXM_OF_TCP_DST[[]]->OXM_OF_TCP_SRC[[]],output:5
 priority=50 tcp ip_frag=later           actions=output:6
 ])
-AT_CHECK([ovs-ofctl replace-flows br0 flows.txt])
+AT_CHECK([ovs-ofctl -O OpenFlow14 replace-flows br0 flows.txt])
 
 base_flow="in_port(90),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=128"
 no_flow="$base_flow,frag=no),tcp(src=12345,dst=80)"
@@ -3742,7 +3742,7 @@ priority=50 tcp ip_frag=no              actions=set_field:81->tcp_dst,output:4
 priority=50 tcp ip_frag=first           actions=set_field:81->tcp_dst,output:5
 priority=50 tcp ip_frag=later           actions=output:6
 ])
-AT_CHECK([ovs-ofctl replace-flows br0 flows.txt])
+AT_CHECK([ovs-ofctl -O OpenFlow14 replace-flows br0 flows.txt])
 
 base_flow="in_port(90),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=128"
 no_flow="$base_flow,frag=no),tcp(src=12345,dst=80)"
@@ -3856,7 +3856,7 @@ ovs-ofctl: actions are invalid with specified match (OFPBAC_MATCH_INCONSISTENT)
 AT_DATA([flows.txt], [dnl
 priority=75 tcp actions=load:42->OXM_OF_TCP_SRC[[0..7]],output:1
 ])
-AT_CHECK([ovs-ofctl -O OpenFlow12 replace-flows br0 flows.txt])
+AT_CHECK([ovs-ofctl -O OpenFlow14 replace-flows br0 flows.txt])
 
 AT_CHECK([ovs-appctl vlog/set dpif:dbg dpif_netdev:dbg])
 
