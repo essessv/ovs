@@ -256,7 +256,7 @@ update_bitmaps_with_supported_table_ids(struct vconn *vconn)
         bmtables = bitmap_allocate1(TABLE_IDS_BITMAP_LEN);
     }
 
-    request = ofputil_encode_table_features_request(vconn_get_version(vconn));
+    request = ofpraw_alloc(OFPRAW_OFPST_TABLE_REQUEST, vconn_get_version(vconn), 0);
     perform_stats_transaction(vconn, request, false);
     bitmap_and(bmtables, visible_tables, TABLE_IDS_BITMAP_LEN);
 }
@@ -273,9 +273,10 @@ populate_visible_tables_bitmap(struct vconn *vconn, const struct ofp_header *oh)
 
     for(;;) {
         struct ofputil_table_features features;
+        struct ofputil_table_stats stats;
         int retval;
 
-        retval = ofputil_decode_table_features(&msg, &features, true);
+        retval = ofputil_decode_table_stats_reply(&msg, &stats, &features);
         if (retval) {
             if (retval != EOF) {
                 ovs_fatal(0, "%s: Error while decoding table features: %s",
