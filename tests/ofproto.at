@@ -3066,7 +3066,7 @@ ${PERL} -e '
 ') > flows.txt
 AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
 # Check that multipart flow dumps work properly:
-AT_CHECK([ovs-ofctl diff-flows br0 flows.txt])
+AT_CHECK([ovs-ofctl -O OpenFlow14 diff-flows br0 flows.txt])
 AT_CHECK([ovs-ofctl add-flow br0 in_port=1,cookie=3,actions=drop])
 AT_CHECK([ovs-ofctl mod-flows br0 in_port=2,cookie=2,actions=output:2])
 AT_CHECK([ovs-ofctl del-flows br0 cookie=1/-1])
