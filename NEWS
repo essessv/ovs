@@ -24,6 +24,7 @@ Post-v2.4.0
    - Mark --syslog-target argument as deprecated.  It will be removed in
      the next OVS release.
    - Added --user option to all daemons
+   - ovs-ofctl: replace-flows and diff-flows now operate on multiple tables.
 
 
 v2.4.0 - 20 Aug 2015
