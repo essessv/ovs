@@ -109,22 +109,24 @@ static bool timestamp;
 static char *unixctl_path;
 
 /* -T, --tables: Comma-separated list of OF flow table IDs to replace flows in.
- *  tables is an array that has the table IDs specified in order. */
+ *  tables is an array that has the table IDs specified in order.
+ */
 static uint8_t tables[NUMBER_OF_TABLES];
 static int n_tables;
 
-/* Array of pointers to classifiers - one for each table. */
+/* An array of pointers to classifiers - one for each table. */
 static struct classifier *classifiers[NUMBER_OF_TABLES];
 
-/* bmtables is a bitmap where an offset is set if the corresponding table
+/* A bitmap where an offset is set if the corresponding table
  * ID needs to be operated on by replace-flows or diff-flows command.  If a
  * table ID is hidden, the corresponding offset is unset even if specified
- * in -T, --tables. */
+ * in -T, --tables.
+ */
 static unsigned long *bmtables;
 
-/*
- * visible_tables is a bitmap where an offset is set if the corresponding table
- * ID is not hidden. */
+/* A bitmap where an offset is set if the corresponding table
+ * ID is not hidden.
+ */
 static unsigned long *visible_tables;
 
 /* --sort, --rsort: Sort order. */
@@ -150,30 +152,30 @@ static void perform_stats_transaction(struct vconn *,
                                       struct ofpbuf *request,
                                       bool dump);
 
-static int tables_and_bitmap_from_string(const char *);
+static bool tables_and_bitmap_from_string(const char *);
 
 static void update_bitmaps_with_supported_table_ids(struct vconn *);
 
 static void populate_visible_tables_bitmap(struct vconn *,
                                     const struct ofp_header *);
 
-bool print_diff_flows(struct classifier *cls);
+static bool print_diff_flows(struct classifier *);
 
-static void fte_free_all(struct classifier *cls);
+static void fte_free_all(struct classifier *);
 
 /* Initializes the array of classifiers. */
 static void
 initialize_classifiers(void)
 {
-    for (int table_id=0; table_id < NUMBER_OF_TABLES; table_id++) {
+    int table_id;
+
+    for (table_id=0; table_id < NUMBER_OF_TABLES; table_id++) {
         classifiers[table_id] = NULL;
     }
 }
 
 /* Creates a classifier for table with ID 'table_id' and adds it to the
- * array of classifiers.
- *
- * Returns the '*classifier'.
+ * array of classifiers.  Returns the '*classifier'.
  */
 static struct classifier *
 insert_new_classifier(uint8_t table_id)
@@ -196,7 +198,9 @@ get_classifier(uint8_t table_id)
 static void
 destroy_classifiers(void)
 {
-    for (int table_id=0; table_id < NUMBER_OF_TABLES; table_id++) {
+    int table_id;
+
+    for (table_id=0; table_id < NUMBER_OF_TABLES; table_id++) {
         if (classifiers[table_id] != NULL) {
             fte_free_all(classifiers[table_id]);
             free(classifiers[table_id]);
@@ -205,38 +209,43 @@ destroy_classifiers(void)
 }
 
 /*
- * Takes a string of comma-separated table IDs, populates the array of
- * table_ids in the order specified in the --tables argument.  Also creates
+ * Takes a string '*s' of comma-separated table IDs and populates the array of
+ * table IDs in the order specified in the --tables argument.  Also, creates
  * a bitmap of specified table IDs.
+ *
+ * Returns true if successful, otherwise false.
  */
-static int
+static bool
 tables_and_bitmap_from_string(const char *s)
 {
     char *stemp = xstrdup(s);
     char *tok, *temp;
     unsigned int table_id;
     n_tables = 0;
-    bmtables = bitmap_allocate(TABLE_IDS_BITMAP_LEN);
 
+    bmtables = bitmap_allocate(TABLE_IDS_BITMAP_LEN);
     temp = stemp;
-    while(stemp) {
+
+    while (stemp) {
         tok = strsep(&stemp, ",");
-        if(!str_to_uint(tok, 10, &table_id)
+        if (!str_to_uint(tok, 10, &table_id)
                 || table_id > TABLE_IDS_BITMAP_LEN-1) {
             bitmap_free(bmtables);
             free(temp);
-            return -1;
+            return false;
         }
         tables[n_tables++] = table_id;
         bitmap_set(bmtables, table_id, true);
     }
     free(temp);
-    return 0;
+
+    return true;
 }
 
 /*
- * Make sure a bmtables offset is set only if the corresponding
- * table ID is supported (not hidden) in the switch.
+ * Makes sure a bmtables bit is set only if the corresponding
+ * table ID is supported (not hidden) in the switch.  The connection '*vconn'
+ * is used to get the supported table IDs.
  */
 static void
 update_bitmaps_with_supported_table_ids(struct vconn *vconn)
@@ -245,7 +254,7 @@ update_bitmaps_with_supported_table_ids(struct vconn *vconn)
 
     visible_tables = bitmap_allocate(TABLE_IDS_BITMAP_LEN);
 
-    if(n_tables == 0) {
+    if (n_tables == 0) {
         /* Initialize the bitmap bmtables and set all bits. */
         bmtables = bitmap_allocate1(TABLE_IDS_BITMAP_LEN);
     }
@@ -257,17 +266,18 @@ update_bitmaps_with_supported_table_ids(struct vconn *vconn)
 }
 
 /*
- * Get all visible table IDs and set offsets in visible_tables bitmap that
- * correspond to the table IDs.
+ * Uses connection '*vconn' to get all visible table IDs.  Sets offsets in
+ * visible_tables bitmap that correspond to the table IDs.
  */
 static void
-populate_visible_tables_bitmap(struct vconn *vconn, const struct ofp_header *oh)
+populate_visible_tables_bitmap(struct vconn *vconn,
+                               const struct ofp_header *oh)
 {
     struct ofpbuf msg;
     ofpbuf_use_const(&msg, oh, ntohs(oh->length));
     ofpraw_pull_assert(&msg);
 
-    for(;;) {
+    for (;;) {
         struct ofputil_table_features features;
         struct ofputil_table_stats stats;
         int retval;
@@ -285,16 +295,17 @@ populate_visible_tables_bitmap(struct vconn *vconn, const struct ofp_header *oh)
 }
 
 /*
- * Given a table_id, get the corresponding classifier.  If there is no
- * classifier for the given table_id, create one.
+ * Returns the classifier for a given 'table_id'.  Creates the classifier if
+ * there is no classifier for the given 'table_id'.
  */
 static struct classifier *
 return_classifier_for_table(uint8_t table_id)
 {
     struct classifier *cls;
-    if(n_tables > 0
-            && bmtables
-            && !bitmap_is_set(bmtables, table_id)) {
+
+    if (n_tables > 0
+        && bmtables
+        && !bitmap_is_set(bmtables, table_id)) {
         /*
          *  Ignore this flow if --tables is specified but does
          *  not contain the table_id.
@@ -309,22 +320,23 @@ return_classifier_for_table(uint8_t table_id)
 }
 
 /*
- * Given an index, return the corresponding classifier.  If -T has been
- * specified, return the table ID for the index.
+ * Returns the classifier for a given 'index'.  If the order of tables has been
+ * specified using --tables, return classifier indexed by 'index' in the
+ * 'tables' array.
  */
 static struct classifier *
 return_classifier_and_current_tableid(int *id, int index)
 {
     struct classifier *cls;
 
-    if (n_tables > 0) {
-        /* Get classifier for the table in the order specified. */
-        cls = get_classifier(tables[index]);
-        *id = tables[index];
-    }
-    else {
+    if (n_tables == 0) {
         cls = get_classifier(index);
         *id = index;
+    } else {
+        /* Since --tables has been specified, get classifier for the table
+         * indexed by 'index' in 'tables' array. */
+        cls = get_classifier(tables[index]);
+        *id = tables[index];
     }
     return cls;
 }
@@ -426,7 +438,7 @@ parse_options(int argc, char *argv[])
     for (;;) {
         unsigned long int timeout;
         int c;
-        int retval = 0;
+        bool retval = 0;
 
         c = getopt_long(argc, argv, short_options, long_options, NULL);
         if (c == -1) {
@@ -446,12 +458,11 @@ parse_options(int argc, char *argv[])
 
         case 'T':
             retval = tables_and_bitmap_from_string(optarg);
-            if (retval < 0) {
+            if (!retval) {
                 ovs_fatal(0, "one of the passed table IDs %s for "
                         "-T or --tables is invalid", optarg);
             }
             break;
-
 
         case 'F':
             allowed_protocols = ofputil_protocols_from_string(optarg);
@@ -772,10 +783,13 @@ dump_trivial_transaction(const char *vconn_name, enum ofpraw raw)
 
 /*
  * Sends the stats 'request' using the connection 'vconn'.  If 'dump' is true,
- * prints the stats response to stdout.
+ * prints the stats response to stdout.  If 'dump' is false, gets the list of
+ * supported tables, and updates 'bmtables'.
  */
 static void
-perform_stats_transaction(struct vconn *vconn, struct ofpbuf *request, bool dump)
+perform_stats_transaction(struct vconn *vconn,
+                          struct ofpbuf *request,
+                          bool dump)
 {
     const struct ofp_header *request_oh = request->data;
     ovs_be32 send_xid = request_oh->xid;
@@ -800,7 +814,7 @@ perform_stats_transaction(struct vconn *vconn, struct ofpbuf *request, bool dump
                 ofp_print(stdout, reply->data, reply->size, verbosity + 1);
             }
             else {
-                /* Update bmtables - set offset = table ID. */
+                /* Update bmtables - set table ID bit in bmtables. */
                 populate_visible_tables_bitmap(vconn,
                                               (struct ofp_header *) reply->data);
             }
@@ -2982,6 +2996,7 @@ read_flows_from_switch(struct vconn *vconn,
     else {
         fsr.table_id = 0xff;
     }
+
     fsr.cookie = fsr.cookie_mask = htonll(0);
     fsr.out_group = OFPG11_ANY;
     fsr.out_port = OFPP_ANY;
@@ -2992,6 +3007,7 @@ read_flows_from_switch(struct vconn *vconn,
 
     reply = NULL;
     ofpbuf_init(&ofpacts, 0);
+
     while (recv_flow_stats_reply(vconn, send_xid, &reply, &fs, &ofpacts)) {
         struct fte_version *version;
 
@@ -3052,7 +3068,6 @@ fte_make_flow_mod(const struct fte *fte,
     list_push_back(packets, &ofm->list_node);
 }
 
-
 static void
 construct_flow_mods(struct ovs_list *requests,
                     enum ofputil_protocol protocol,
@@ -3090,13 +3105,13 @@ add_update_delete_switch_flows(struct ovs_list *requests,
 {
     struct classifier *cls;
     struct fte *fte;
-
+    int table_id;
     /* current_id can be either table_id or tables[table_id]. */
     int current_id = 0;
 
     int num_tables = n_tables > 0 ? n_tables: NUMBER_OF_TABLES;
 
-    for (int table_id=0; table_id < num_tables; table_id++) {
+    for (table_id=0; table_id < num_tables; table_id++) {
         cls = return_classifier_and_current_tableid(&current_id, table_id);
         if (cls == NULL) {
             continue;
@@ -3170,7 +3185,7 @@ read_flows_from_source(const char *source, int index)
     }
 }
 
-bool
+static bool
 print_diff_flows(struct classifier *cls)
 {
     struct ds a_s, b_s;
@@ -3209,6 +3224,7 @@ ofctl_diff_flows(struct ovs_cmdl_context *ctx)
     bool differences = false;
     struct classifier *cls;
     int current_id = 0;
+    int table_id;
 
     initialize_classifiers();
 
@@ -3217,9 +3233,7 @@ ofctl_diff_flows(struct ovs_cmdl_context *ctx)
 
     int num_tables = n_tables > 0 ? n_tables : NUMBER_OF_TABLES;
 
-    for (int table_id=0; table_id < num_tables; table_id++) {
-
-        /* current_id is not used. */
+    for (table_id=0; table_id < num_tables; table_id++) {
         cls = return_classifier_and_current_tableid(&current_id, table_id);
         if (cls == NULL) {
             continue;
