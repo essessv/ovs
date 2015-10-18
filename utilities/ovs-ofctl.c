@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 
+#include "bitmap.h"
 #include "byte-order.h"
 #include "classifier.h"
 #include "command-line.h"
@@ -37,6 +38,7 @@
 #include "dirs.h"
 #include "dynamic-string.h"
 #include "fatal-signal.h"
+#include "list.h"
 #include "nx-match.h"
 #include "odp-util.h"
 #include "ofp-actions.h"
@@ -50,6 +52,7 @@
 #include "ofproto/ofproto.h"
 #include "openflow/nicira-ext.h"
 #include "openflow/openflow.h"
+#include "openflow/openflow-common.h"
 #include "dp-packet.h"
 #include "packets.h"
 #include "pcap-file.h"
@@ -66,6 +69,9 @@
 #include "sort.h"
 
 VLOG_DEFINE_THIS_MODULE(ofctl);
+
+#define TABLE_IDS_BITMAP_LEN (OFPTT_MAX + 1)
+#define NUMBER_OF_TABLES (OFPTT_MAX + 1)
 
 /* --bundle: Use OpenFlow 1.4 bundle for making the flow table change atomic.
  * NOTE: Also the flow mod will use OpenFlow 1.4, so the semantics may be
@@ -102,6 +108,25 @@ static bool timestamp;
      commands. */
 static char *unixctl_path;
 
+/* -T, --tables: Comma-separated list of OF flow table IDs to replace flows in.
+ *  tables is an array that has the table IDs specified in order. */
+static uint8_t tables[NUMBER_OF_TABLES];
+static int n_tables;
+
+/* Array of pointers to classifiers - one for each table. */
+static struct classifier *classifiers[NUMBER_OF_TABLES];
+
+/* bmtables is a bitmap where an offset is set if the corresponding table
+ * ID needs to be operated on by replace-flows or diff-flows command.  If a
+ * table ID is hidden, the corresponding offset is unset even if specified
+ * in -T, --tables. */
+static unsigned long *bmtables;
+
+/*
+ * visible_tables is a bitmap where an offset is set if the corresponding table
+ * ID is not hidden. */
+static unsigned long *visible_tables;
+
 /* --sort, --rsort: Sort order. */
 enum sort_order { SORT_ASC, SORT_DESC };
 struct sort_criterion {
@@ -120,6 +145,190 @@ static bool recv_flow_stats_reply(struct vconn *, ovs_be32 send_xid,
                                   struct ofpbuf **replyp,
                                   struct ofputil_flow_stats *,
                                   struct ofpbuf *ofpacts);
+
+static void perform_stats_transaction(struct vconn *,
+                                      struct ofpbuf *request,
+                                      bool dump);
+
+static int tables_and_bitmap_from_string(const char *);
+
+static void update_bitmaps_with_supported_table_ids(struct vconn *);
+
+static void populate_visible_tables_bitmap(struct vconn *,
+                                    const struct ofp_header *);
+
+bool print_diff_flows(struct classifier *cls);
+
+static void fte_free_all(struct classifier *cls);
+
+/* Initializes the array of classifiers. */
+static void
+initialize_classifiers(void)
+{
+    for (int table_id=0; table_id < NUMBER_OF_TABLES; table_id++) {
+        classifiers[table_id] = NULL;
+    }
+}
+
+/* Creates a classifier for table with ID 'table_id' and adds it to the
+ * array of classifiers.
+ *
+ * Returns the '*classifier'.
+ */
+static struct classifier *
+insert_new_classifier(uint8_t table_id)
+{
+    classifiers[table_id] = xzalloc(sizeof(struct classifier));
+    classifier_init(classifiers[table_id], NULL);
+    return classifiers[table_id];
+}
+
+/* Returns the '*classifier' for the table with ID 'table_id'. */
+static struct classifier *
+get_classifier(uint8_t table_id)
+{
+    return classifiers[table_id];
+}
+
+/* Frees memory allocated to classifiers.  Also, destroys all flows
+ * within those classifiers.
+ */
+static void
+destroy_classifiers(void)
+{
+    for (int table_id=0; table_id < NUMBER_OF_TABLES; table_id++) {
+        if (classifiers[table_id] != NULL) {
+            fte_free_all(classifiers[table_id]);
+            free(classifiers[table_id]);
+        }
+    }
+}
+
+/*
+ * Takes a string of comma-separated table IDs, populates the array of
+ * table_ids in the order specified in the --tables argument.  Also creates
+ * a bitmap of specified table IDs.
+ */
+static int
+tables_and_bitmap_from_string(const char *s)
+{
+    char *stemp = xstrdup(s);
+    char *tok, *temp;
+    unsigned int table_id;
+    n_tables = 0;
+    bmtables = bitmap_allocate(TABLE_IDS_BITMAP_LEN);
+
+    temp = stemp;
+    while(stemp) {
+        tok = strsep(&stemp, ",");
+        if(!str_to_uint(tok, 10, &table_id)
+                || table_id > TABLE_IDS_BITMAP_LEN-1) {
+            bitmap_free(bmtables);
+            free(temp);
+            return -1;
+        }
+        tables[n_tables++] = table_id;
+        bitmap_set(bmtables, table_id, true);
+    }
+    free(temp);
+    return 0;
+}
+
+/*
+ * Make sure a bmtables offset is set only if the corresponding
+ * table ID is supported (not hidden) in the switch.
+ */
+static void
+update_bitmaps_with_supported_table_ids(struct vconn *vconn)
+{
+    struct ofpbuf *request;
+
+    visible_tables = bitmap_allocate(TABLE_IDS_BITMAP_LEN);
+
+    if(n_tables == 0) {
+        /* Initialize the bitmap bmtables and set all bits. */
+        bmtables = bitmap_allocate1(TABLE_IDS_BITMAP_LEN);
+    }
+
+    request = ofpraw_alloc(OFPRAW_OFPST_TABLE_REQUEST,
+                           vconn_get_version(vconn), 0);
+    perform_stats_transaction(vconn, request, false);
+    bitmap_and(bmtables, visible_tables, TABLE_IDS_BITMAP_LEN);
+}
+
+/*
+ * Get all visible table IDs and set offsets in visible_tables bitmap that
+ * correspond to the table IDs.
+ */
+static void
+populate_visible_tables_bitmap(struct vconn *vconn, const struct ofp_header *oh)
+{
+    struct ofpbuf msg;
+    ofpbuf_use_const(&msg, oh, ntohs(oh->length));
+    ofpraw_pull_assert(&msg);
+
+    for(;;) {
+        struct ofputil_table_features features;
+        struct ofputil_table_stats stats;
+        int retval;
+
+        retval = ofputil_decode_table_stats_reply(&msg, &stats, &features);
+        if (retval) {
+            if (retval != EOF) {
+                ovs_fatal(0, "%s: Error while decoding table features: %s",
+                          vconn_get_name(vconn), ofperr_get_name(retval));
+            }
+            return;
+        }
+        bitmap_set(visible_tables, features.table_id, true);
+    }
+}
+
+/*
+ * Given a table_id, get the corresponding classifier.  If there is no
+ * classifier for the given table_id, create one.
+ */
+static struct classifier *
+return_classifier_for_table(uint8_t table_id)
+{
+    struct classifier *cls;
+    if(n_tables > 0
+            && bmtables
+            && !bitmap_is_set(bmtables, table_id)) {
+        /*
+         *  Ignore this flow if --tables is specified but does
+         *  not contain the table_id.
+         */
+        return NULL;
+    }
+    cls = get_classifier(table_id);
+    if (cls == NULL) {
+        cls = insert_new_classifier(table_id);
+    }
+    return cls;
+}
+
+/*
+ * Given an index, return the corresponding classifier.  If -T has been
+ * specified, return the table ID for the index.
+ */
+static struct classifier *
+return_classifier_and_current_tableid(int *id, int index)
+{
+    struct classifier *cls;
+
+    if (n_tables > 0) {
+        /* Get classifier for the table in the order specified. */
+        cls = get_classifier(tables[index]);
+        *id = tables[index];
+    }
+    else {
+        cls = get_classifier(index);
+        *id = index;
+    }
+    return cls;
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -173,6 +382,7 @@ parse_options(int argc, char *argv[])
         VLOG_OPTION_ENUMS
     };
     static const struct option long_options[] = {
+        {"tables", required_argument, NULL, 'T'},
         {"timeout", required_argument, NULL, 't'},
         {"strict", no_argument, NULL, OPT_STRICT},
         {"readd", no_argument, NULL, OPT_READD},
@@ -216,6 +426,7 @@ parse_options(int argc, char *argv[])
     for (;;) {
         unsigned long int timeout;
         int c;
+        int retval = 0;
 
         c = getopt_long(argc, argv, short_options, long_options, NULL);
         if (c == -1) {
@@ -232,6 +443,15 @@ parse_options(int argc, char *argv[])
                 time_alarm(timeout);
             }
             break;
+
+        case 'T':
+            retval = tables_and_bitmap_from_string(optarg);
+            if (retval < 0) {
+                ovs_fatal(0, "one of the passed table IDs %s for "
+                        "-T or --tables is invalid", optarg);
+            }
+            break;
+
 
         case 'F':
             allowed_protocols = ofputil_protocols_from_string(optarg);
@@ -401,6 +621,7 @@ usage(void)
     ofp_version_usage();
     vlog_usage();
     printf("\nOther options:\n"
+           "  -T, --tables=TABLES         replace or diff flows in specified TABLES\n"
            "  --strict                    use strict match for flow commands\n"
            "  --readd                     replace flows that haven't changed\n"
            "  -F, --flow-format=FORMAT    force particular flow format\n"
@@ -549,8 +770,12 @@ dump_trivial_transaction(const char *vconn_name, enum ofpraw raw)
     vconn_close(vconn);
 }
 
+/*
+ * Sends the stats 'request' using the connection 'vconn'.  If 'dump' is true,
+ * prints the stats response to stdout.
+ */
 static void
-dump_stats_transaction(struct vconn *vconn, struct ofpbuf *request)
+perform_stats_transaction(struct vconn *vconn, struct ofpbuf *request, bool dump)
 {
     const struct ofp_header *request_oh = request->data;
     ovs_be32 send_xid = request_oh->xid;
@@ -571,9 +796,14 @@ dump_stats_transaction(struct vconn *vconn, struct ofpbuf *request)
         recv_xid = ((struct ofp_header *) reply->data)->xid;
         if (send_xid == recv_xid) {
             enum ofpraw raw;
-
-            ofp_print(stdout, reply->data, reply->size, verbosity + 1);
-
+            if (dump) {
+                ofp_print(stdout, reply->data, reply->size, verbosity + 1);
+            }
+            else {
+                /* Update bmtables - set offset = table ID. */
+                populate_visible_tables_bitmap(vconn,
+                                              (struct ofp_header *) reply->data);
+            }
             ofpraw_decode(&raw, reply->data);
             if (ofptype_from_ofpraw(raw) == OFPTYPE_ERROR) {
                 done = true;
@@ -590,6 +820,12 @@ dump_stats_transaction(struct vconn *vconn, struct ofpbuf *request)
         }
         ofpbuf_delete(reply);
     }
+}
+
+static void
+dump_stats_transaction(struct vconn *vconn, struct ofpbuf *request)
+{
+    perform_stats_transaction(vconn, request, true);
 }
 
 static void
@@ -2585,6 +2821,7 @@ fte_insert(struct classifier *cls, const struct match *match,
            int priority, struct fte_version *version, int index)
 {
     struct fte *old, *fte;
+    classifier_defer(cls);
 
     fte = xzalloc(sizeof *fte);
     cls_rule_init(&fte->rule, match, priority);
@@ -2604,12 +2841,13 @@ fte_insert(struct classifier *cls, const struct match *match,
  * with the specified 'index'.  Returns the flow formats able to represent the
  * flows that were read. */
 static enum ofputil_protocol
-read_flows_from_file(const char *filename, struct classifier *cls, int index)
+read_flows_from_file(const char *filename, int index)
 {
     enum ofputil_protocol usable_protocols;
     int line_number;
     struct ds s;
     FILE *file;
+    struct classifier *cls;
 
     file = !strcmp(filename, "-") ? stdin : fopen(filename, "r");
     if (file == NULL) {
@@ -2619,7 +2857,7 @@ read_flows_from_file(const char *filename, struct classifier *cls, int index)
     ds_init(&s);
     usable_protocols = OFPUTIL_P_ANY;
     line_number = 0;
-    classifier_defer(cls);
+
     while (!ds_get_preprocessed_line(&s, file, &line_number)) {
         struct fte_version *version;
         struct ofputil_flow_mod fm;
@@ -2641,10 +2879,18 @@ read_flows_from_file(const char *filename, struct classifier *cls, int index)
                                      | OFPUTIL_FF_EMERG);
         version->ofpacts = fm.ofpacts;
         version->ofpacts_len = fm.ofpacts_len;
+        if (fm.table_id == 0xff) {
+            fm.table_id = 0x0;
+        }
+
+        cls = return_classifier_for_table(fm.table_id);
+        if (cls == NULL) {
+            continue;
+        }
 
         fte_insert(cls, &fm.match, fm.priority, version, index);
     }
-    classifier_publish(cls);
+
     ds_destroy(&s);
 
     if (file != stdin) {
@@ -2713,8 +2959,9 @@ recv_flow_stats_reply(struct vconn *vconn, ovs_be32 send_xid,
 static void
 read_flows_from_switch(struct vconn *vconn,
                        enum ofputil_protocol protocol,
-                       struct classifier *cls, int index)
+                       int index)
 {
+    struct classifier *cls;
     struct ofputil_flow_stats_request fsr;
     struct ofputil_flow_stats fs;
     struct ofpbuf *request;
@@ -2724,16 +2971,27 @@ read_flows_from_switch(struct vconn *vconn,
 
     fsr.aggregate = false;
     match_init_catchall(&fsr.match);
-    fsr.out_port = OFPP_ANY;
-    fsr.table_id = 0xff;
+
+    /* Only get tables that are not hidden. */
+    update_bitmaps_with_supported_table_ids(vconn);
+
+    if (n_tables == 1) {
+        /* Only retrieve flows from the specified table. */
+        fsr.table_id = tables[0];
+    }
+    else {
+        fsr.table_id = 0xff;
+    }
     fsr.cookie = fsr.cookie_mask = htonll(0);
+    fsr.out_group = OFPG11_ANY;
+    fsr.out_port = OFPP_ANY;
+
     request = ofputil_encode_flow_stats_request(&fsr, protocol);
     send_xid = ((struct ofp_header *) request->data)->xid;
     send_openflow_buffer(vconn, request);
 
     reply = NULL;
     ofpbuf_init(&ofpacts, 0);
-    classifier_defer(cls);
     while (recv_flow_stats_reply(vconn, send_xid, &reply, &fs, &ofpacts)) {
         struct fte_version *version;
 
@@ -2746,34 +3004,40 @@ read_flows_from_switch(struct vconn *vconn,
         version->ofpacts_len = fs.ofpacts_len;
         version->ofpacts = xmemdup(fs.ofpacts, fs.ofpacts_len);
 
+        cls = return_classifier_for_table(fs.table_id);
+        if (cls == NULL) {
+            continue;
+        }
+
         fte_insert(cls, &fs.match, fs.priority, version, index);
     }
-    classifier_publish(cls);
     ofpbuf_uninit(&ofpacts);
 }
 
 static void
-fte_make_flow_mod(const struct fte *fte, int index, uint16_t command,
-                  enum ofputil_protocol protocol, struct ovs_list *packets)
+fte_make_flow_mod(const struct fte *fte,
+                  int index, uint16_t command,
+                  enum ofputil_protocol protocol,
+                  struct ovs_list *packets, uint8_t table_id)
 {
     const struct fte_version *version = fte->versions[index];
     struct ofputil_flow_mod fm;
     struct ofpbuf *ofm;
-
     minimatch_expand(&fte->rule.match, &fm.match);
     fm.priority = fte->rule.priority;
     fm.cookie = htonll(0);
     fm.cookie_mask = htonll(0);
     fm.new_cookie = version->cookie;
     fm.modify_cookie = true;
-    fm.table_id = 0xff;
+    fm.table_id = table_id;
     fm.command = command;
     fm.idle_timeout = version->idle_timeout;
     fm.hard_timeout = version->hard_timeout;
-    fm.importance = version->importance;
     fm.buffer_id = UINT32_MAX;
     fm.out_port = OFPP_ANY;
+    fm.out_group = OFPG_ANY;
     fm.flags = version->flags;
+    fm.importance = version->importance;
     if (command == OFPFC_ADD || command == OFPFC_MODIFY ||
         command == OFPFC_MODIFY_STRICT) {
         fm.ofpacts = version->ofpacts;
@@ -2788,93 +3052,135 @@ fte_make_flow_mod(const struct fte *fte, int index, uint16_t command,
     list_push_back(packets, &ofm->list_node);
 }
 
+
+static void
+construct_flow_mods(struct ovs_list *requests,
+                    enum ofputil_protocol protocol,
+                    struct fte *fte,
+                    uint8_t table_id)
+{
+    enum { FILE_IDX = 0, SWITCH_IDX = 1 };
+    struct fte_version *file_ver = fte->versions[FILE_IDX];
+    struct fte_version *sw_ver = fte->versions[SWITCH_IDX];
+
+    if (sw_ver && !file_ver) {
+        fte_make_flow_mod(fte, SWITCH_IDX,
+                          OFPFC_DELETE_STRICT,
+                          protocol, requests,
+                          table_id);
+    }
+    else if (file_ver
+                && (readd || !sw_ver)) {
+            fte_make_flow_mod(fte, FILE_IDX, OFPFC_ADD,
+                              protocol, requests,
+                              table_id);
+    }
+    else if (file_ver
+                && sw_ver && !fte_version_equals(sw_ver, file_ver)) {
+            fte_make_flow_mod(fte, FILE_IDX,
+                              OFPFC_MODIFY_STRICT,
+                              protocol, requests,
+                              table_id);
+    }
+}
+
+static void
+add_update_delete_switch_flows(struct ovs_list *requests,
+                               enum ofputil_protocol protocol)
+{
+    struct classifier *cls;
+    struct fte *fte;
+
+    /* current_id can be either table_id or tables[table_id]. */
+    int current_id = 0;
+
+    int num_tables = n_tables > 0 ? n_tables: NUMBER_OF_TABLES;
+
+    for (int table_id=0; table_id < num_tables; table_id++) {
+        cls = return_classifier_and_current_tableid(&current_id, table_id);
+        if (cls == NULL) {
+            continue;
+        }
+        classifier_publish(cls);
+        CLS_FOR_EACH(fte, rule, cls) {
+            construct_flow_mods(requests,
+                                protocol,
+                                fte,
+                                current_id);
+        }
+    }
+}
+
 static void
 ofctl_replace_flows(struct ovs_cmdl_context *ctx)
 {
     enum { FILE_IDX = 0, SWITCH_IDX = 1 };
     enum ofputil_protocol usable_protocols, protocol;
-    struct classifier cls;
+
     struct ovs_list requests;
     struct vconn *vconn;
-    struct fte *fte;
 
-    classifier_init(&cls, NULL);
-    usable_protocols = read_flows_from_file(ctx->argv[2], &cls, FILE_IDX);
+    /* Initialize the array of classifiers. */
+    initialize_classifiers();
 
-    protocol = open_vconn(ctx->argv[1], &vconn);
+    /* Read flows from the file. */
+    usable_protocols = read_flows_from_file(ctx->argv[2], FILE_IDX);
+
+    /* Setup connection to the switch. */
+    protocol = open_vconn_for_flow_mod(ctx->argv[1], &vconn, usable_protocols);
     protocol = set_protocol_for_flow_dump(vconn, protocol, usable_protocols);
 
-    read_flows_from_switch(vconn, protocol, &cls, SWITCH_IDX);
+    /* Generate switch dump request. */
+    read_flows_from_switch(vconn, protocol, SWITCH_IDX);
 
     list_init(&requests);
 
-    /* Delete flows that exist on the switch but not in the file. */
-    CLS_FOR_EACH (fte, rule, &cls) {
-        struct fte_version *file_ver = fte->versions[FILE_IDX];
-        struct fte_version *sw_ver = fte->versions[SWITCH_IDX];
+    /* Delete flows that exist on the switch but not in the file.  Add flows
+     * that exist in the file but not on the switch.  Update the flows that
+     * exist in both places but differ.  If --tables is specified, iterate
+     * through tables, perform deletion in order.
+     */
+    add_update_delete_switch_flows(&requests, protocol);
 
-        if (sw_ver && !file_ver) {
-            fte_make_flow_mod(fte, SWITCH_IDX, OFPFC_DELETE_STRICT,
-                              protocol, &requests);
-        }
-    }
-
-    /* Add flows that exist in the file but not on the switch.
-     * Update flows that exist in both places but differ. */
-    CLS_FOR_EACH (fte, rule, &cls) {
-        struct fte_version *file_ver = fte->versions[FILE_IDX];
-        struct fte_version *sw_ver = fte->versions[SWITCH_IDX];
-
-        if (file_ver
-            && (readd || !sw_ver || !fte_version_equals(sw_ver, file_ver))) {
-            fte_make_flow_mod(fte, FILE_IDX, OFPFC_ADD, protocol, &requests);
-        }
-    }
     if (bundle) {
         bundle_transact(vconn, &requests, OFPBF_ORDERED | OFPBF_ATOMIC);
     } else {
         transact_multiple_noreply(vconn, &requests);
     }
+    destroy_classifiers();
     vconn_close(vconn);
-
-    fte_free_all(&cls);
 }
 
 static void
-read_flows_from_source(const char *source, struct classifier *cls, int index)
+read_flows_from_source(const char *source, int index)
 {
     struct stat s;
-
     if (source[0] == '/' || source[0] == '.'
         || (!strchr(source, ':') && !stat(source, &s))) {
-        read_flows_from_file(source, cls, index);
+        read_flows_from_file(source, index);
     } else {
         enum ofputil_protocol protocol;
         struct vconn *vconn;
 
+        /* Setup connection to switch and generate dump request. */
         protocol = open_vconn(source, &vconn);
         protocol = set_protocol_for_flow_dump(vconn, protocol, OFPUTIL_P_ANY);
-        read_flows_from_switch(vconn, protocol, cls, index);
+        read_flows_from_switch(vconn, protocol, index);
         vconn_close(vconn);
     }
 }
 
-static void
-ofctl_diff_flows(struct ovs_cmdl_context *ctx)
+bool
+print_diff_flows(struct classifier *cls)
 {
-    bool differences = false;
-    struct classifier cls;
     struct ds a_s, b_s;
     struct fte *fte;
-
-    classifier_init(&cls, NULL);
-    read_flows_from_source(ctx->argv[1], &cls, 0);
-    read_flows_from_source(ctx->argv[2], &cls, 1);
+    bool differences = false;
 
     ds_init(&a_s);
     ds_init(&b_s);
-
-    CLS_FOR_EACH (fte, rule, &cls) {
+    classifier_publish(cls);
+    CLS_FOR_EACH (fte, rule, cls) {
         struct fte_version *a = fte->versions[0];
         struct fte_version *b = fte->versions[1];
 
@@ -2892,12 +3198,35 @@ ofctl_diff_flows(struct ovs_cmdl_context *ctx)
             }
         }
     }
-
     ds_destroy(&a_s);
     ds_destroy(&b_s);
+    return differences;
+}
 
-    fte_free_all(&cls);
+static void
+ofctl_diff_flows(struct ovs_cmdl_context *ctx)
+{
+    bool differences = false;
+    struct classifier *cls;
+    int current_id = 0;
 
+    initialize_classifiers();
+
+    read_flows_from_source(ctx->argv[1], 0);
+    read_flows_from_source(ctx->argv[2], 1);
+
+    int num_tables = n_tables > 0 ? n_tables : NUMBER_OF_TABLES;
+
+    for (int table_id=0; table_id < num_tables; table_id++) {
+
+        /* current_id is not used. */
+        cls = return_classifier_and_current_tableid(&current_id, table_id);
+        if (cls == NULL) {
+            continue;
+        }
+        differences = print_diff_flows(cls);
+    }
+    destroy_classifiers();
     if (differences) {
         exit(2);
     }
